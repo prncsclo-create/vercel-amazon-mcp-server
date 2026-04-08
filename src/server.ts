@@ -1,16 +1,15 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
-  InitializeRequestSchema,
-  PingRequestSchema,
-  ListResourcesRequestSchema,
-  ListPromptsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import express, { Request, Response } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import { randomUUID } from 'crypto';
 import { searchProducts, addToCart, getCart, checkLoginStatus } from './amazon';
+import { searchWholeFoods, addToWholeFoodsCart, getWholeFoodsCart } from './wholefoods';
 import { closeBrowser, getBrowser, getPage } from './browser';
 import { saveAmazonSession, restoreAmazonSession } from './session-manager';
 
@@ -19,586 +18,256 @@ dotenv.config();
 const PORT = process.env.PORT || 3000;
 const AUTH_TOKEN = process.env.AUTH_TOKEN;
 
-// Create MCP Server
-const mcpServer = new Server({
-  name: 'amazon-cart-server',
-  version: '1.0.0',
-}, {
-  capabilities: {
-    tools: {},
-    resources: {},
-    prompts: {},
+// Tool definitions (single source of truth)
+const TOOLS = [
+  {
+    name: 'search_amazon',
+    description: 'Search for products on Amazon',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        query: { type: 'string', description: 'Search query for Amazon products' },
+      },
+      required: ['query'],
+    },
   },
-});
-
-// Handle initialization
-mcpServer.setRequestHandler(InitializeRequestSchema, async () => {
-  console.log('Initialize request received');
-  return {
-    protocolVersion: '2024-11-05',
-    capabilities: {
-      tools: {},
-      resources: {},
-      prompts: {},
-    },
-    serverInfo: {
-      name: 'amazon-cart-server',
-      version: '1.0.0',
-    },
-  };
-});
-
-// Handle ping (keepalive)
-mcpServer.setRequestHandler(PingRequestSchema, async () => {
-  console.log('Ping request received');
-  return {};
-});
-
-// Handle resources list (we don't have any, but need to respond)
-mcpServer.setRequestHandler(ListResourcesRequestSchema, async () => {
-  console.log('List resources request received');
-  return {
-    resources: [],
-  };
-});
-
-// Handle prompts list (we don't have any, but need to respond)
-mcpServer.setRequestHandler(ListPromptsRequestSchema, async () => {
-  console.log('List prompts request received');
-  return {
-    prompts: [],
-  };
-});
-
-// Define MCP Tools
-mcpServer.setRequestHandler(ListToolsRequestSchema, async () => {
-  console.log('List tools request received');
-  return {
-    tools: [
-    {
-      name: 'search_amazon',
-      description: 'Search for products on Amazon',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          query: {
-            type: 'string',
-            description: 'Search query for Amazon products',
-          },
-        },
-        required: ['query'],
+  {
+    name: 'add_to_cart',
+    description: 'Add a product to Amazon cart',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        query: { type: 'string', description: 'Product name to search and add' },
+        asin: { type: 'string', description: 'Amazon ASIN (product ID) - use this if known' },
+        quantity: { type: 'number', description: 'Quantity to add (default: 1)', default: 1 },
       },
     },
-    {
-      name: 'add_to_cart',
-      description: 'Add a product to Amazon cart',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          query: {
-            type: 'string',
-            description: 'Product name to search and add',
-          },
-          asin: {
-            type: 'string',
-            description: 'Amazon ASIN (product ID) - use this if known',
-          },
-          quantity: {
-            type: 'number',
-            description: 'Quantity to add (default: 1)',
-            default: 1,
-          },
-        },
+  },
+  {
+    name: 'view_cart',
+    description: 'View current Amazon cart contents',
+    inputSchema: { type: 'object' as const, properties: {} },
+  },
+  {
+    name: 'check_login',
+    description: 'Check if logged into Amazon',
+    inputSchema: { type: 'object' as const, properties: {} },
+  },
+  {
+    name: 'save_session',
+    description: '(Optional) Manually trigger session save. Sessions are automatically saved periodically, after operations, and on shutdown, so this is typically not needed.',
+    inputSchema: { type: 'object' as const, properties: {} },
+  },
+  {
+    name: 'search_wholefoods',
+    description: 'Search for grocery products on Whole Foods Market via Amazon. Results are scoped to items available for Whole Foods delivery.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        query: { type: 'string', description: 'Search query for Whole Foods grocery products' },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'add_to_wholefoods_cart',
+    description: 'Add a grocery product to the Whole Foods / Amazon Fresh cart. Use this instead of add_to_cart for grocery items.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        query: { type: 'string', description: 'Product name to search and add from Whole Foods' },
+        asin: { type: 'string', description: 'Amazon ASIN (product ID) - use this if known from a previous search' },
+        quantity: { type: 'number', description: 'Quantity to add (default: 1)', default: 1 },
       },
     },
-    {
-      name: 'view_cart',
-      description: 'View current Amazon cart contents',
-      inputSchema: {
-        type: 'object',
-        properties: {},
-      },
-    },
-    {
-      name: 'check_login',
-      description: 'Check if logged into Amazon',
-      inputSchema: {
-        type: 'object',
-        properties: {},
-      },
-    },
-    {
-      name: 'save_session',
-      description: '(Optional) Manually trigger session save. Sessions are automatically saved periodically, after operations, and on shutdown, so this is typically not needed.',
-      inputSchema: {
-        type: 'object',
-        properties: {},
-      },
-    },
-    ],
-  };
-});
+  },
+  {
+    name: 'view_wholefoods_cart',
+    description: 'View the current Whole Foods / Amazon Fresh grocery cart contents and subtotal.',
+    inputSchema: { type: 'object' as const, properties: {} },
+  },
+];
 
-mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+// Create a new MCP server instance with handlers
+function createMcpServer(): Server {
+  const server = new Server(
+    { name: 'amazon-cart-server', version: '1.0.0' },
+    { capabilities: { tools: {} } },
+  );
 
-  try {
-    let result;
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    return { tools: TOOLS };
+  });
 
-    switch (name) {
-      case 'search_amazon':
-        result = await searchProducts((args as any)?.query);
-        break;
-      case 'add_to_cart':
-        result = await addToCart(args as any);
-        break;
-      case 'view_cart':
-        result = await getCart();
-        break;
-      case 'check_login':
-        result = await checkLoginStatus();
-        break;
-      case 'save_session':
-        const page = await getPage();
-        await saveAmazonSession(page);
-        result = {
-          success: true,
-          message: 'Amazon session saved successfully. Your login will persist across server restarts.',
-        };
-        break;
-      default:
-        throw new Error(`Unknown tool: ${name}`);
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+
+    try {
+      let result;
+
+      switch (name) {
+        case 'search_amazon':
+          result = await searchProducts((args as any)?.query);
+          break;
+        case 'add_to_cart':
+          result = await addToCart(args as any);
+          break;
+        case 'view_cart':
+          result = await getCart();
+          break;
+        case 'check_login':
+          result = await checkLoginStatus();
+          break;
+        case 'save_session': {
+          const page = await getPage();
+          await saveAmazonSession(page);
+          result = {
+            success: true,
+            message: 'Amazon session saved successfully. Your login will persist across server restarts.',
+          };
+          break;
+        }
+        case 'search_wholefoods':
+          result = await searchWholeFoods((args as any)?.query);
+          break;
+        case 'add_to_wholefoods_cart':
+          result = await addToWholeFoodsCart(args as any);
+          break;
+        case 'view_wholefoods_cart':
+          result = await getWholeFoodsCart();
+          break;
+        default:
+          throw new Error(`Unknown tool: ${name}`);
+      }
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+        }, null, 2) }],
+        isError: true,
+      };
     }
+  });
 
-    return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify(result, null, 2),
-        },
-      ],
-    };
-  } catch (error) {
-    return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify({
-            success: false,
-            error: error instanceof Error ? error.message : String(error),
-          }, null, 2),
-        },
-      ],
-      isError: true,
-    };
-  }
-});
+  return server;
+}
 
-// Create Express server for HTTP transport
+// Create Express server
 const app = express();
-
-// CORS must be configured before other middleware
-app.use(cors({
-  origin: '*',
-  credentials: true,
-}));
-
-// JSON parsing for non-SSE endpoints
-app.use((req, res, next) => {
-  // Skip JSON parsing for SSE endpoint
-  if (req.path === '/sse') {
-    return next();
-  }
-  express.json()(req, res, next);
-});
-
-// Disable compression and caching for SSE
-app.set('etag', false);
-app.set('x-powered-by', false);
-
-// Track active SSE connections
-interface SSEConnection {
-  res: Response;
-  sessionId: string;
-}
-
-const activeConnections = new Map<string, SSEConnection>();
-
-// Helper to send SSE message
-function sendSSEMessage(res: Response, data: any) {
-  // MCP SSE requires explicit "message" event type for JSON-RPC responses
-  const message = `event: message\ndata: ${JSON.stringify(data)}\n\n`;
-  res.write(message);
-  // Flush the response to ensure it's sent immediately
-  if ('flush' in res && typeof (res as any).flush === 'function') {
-    (res as any).flush();
-  }
-}
+app.use(cors({ origin: '*', credentials: true }));
+app.disable('etag');
+app.disable('x-powered-by');
 
 // Authentication middleware
 const authenticate = (req: Request, res: Response, next: express.NextFunction) => {
-  // Check multiple auth methods
   const headerToken = req.headers.authorization?.replace(/^Bearer\s+/i, '');
   const queryToken = req.query.token as string;
   const providedToken = headerToken || queryToken;
 
-  console.log('Auth attempt:', {
-    hasAuthHeader: !!req.headers.authorization,
-    hasQueryToken: !!queryToken,
-    path: req.path
-  });
-
-  // If no AUTH_TOKEN is set, allow all requests
   if (!AUTH_TOKEN) {
-    console.log('No AUTH_TOKEN set - allowing request');
     next();
     return;
   }
 
-  // Check if provided token matches
   if (providedToken === AUTH_TOKEN) {
-    console.log('Auth successful');
     next();
   } else {
-    console.log('Auth failed - invalid or missing token');
     res.status(401).json({ error: 'Unauthorized' });
   }
 };
 
-// Health check endpoint
+// Health check
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', server: 'amazon-mcp-server' });
 });
 
-// SSE endpoint for MCP
-app.get('/sse', authenticate, async (req: Request, res: Response) => {
-  console.log('\n=== NEW SSE CONNECTION ===');
-  console.log('Request URL:', req.url);
-  console.log('Request query:', req.query);
+// Track transports per session
+const transports = new Map<string, StreamableHTTPServerTransport>();
 
-  // Send SSE headers immediately using writeHead
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache, no-transform',
-    'Connection': 'keep-alive',
-    'X-Accel-Buffering': 'no',
-  });
+// Streamable HTTP endpoint
+app.all('/mcp', authenticate, express.json(), async (req: Request, res: Response) => {
+  const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
-  // Disable buffering on the socket
-  const socket = res.socket || (req as any).socket;
-  if (socket) {
-    socket.setTimeout(0);
-    socket.setNoDelay(true);
-    socket.setKeepAlive(true);
-  }
+  if (req.method === 'POST') {
+    let transport: StreamableHTTPServerTransport;
 
-  // Generate session ID
-  const sessionId = `session_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-  console.log('Created SSE session:', sessionId);
+    if (sessionId && transports.has(sessionId)) {
+      transport = transports.get(sessionId)!;
+    } else if (!sessionId) {
+      // New session
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+      });
 
-  // Store connection
-  activeConnections.set(sessionId, { res, sessionId });
+      transport.onclose = () => {
+        const sid = transport.sessionId;
+        if (sid) transports.delete(sid);
+      };
 
-  // Send initial comment to establish connection
-  res.write(': connected\n\n');
-
-  // Send endpoint event telling client where to POST messages
-  const protocol = req.headers['x-forwarded-proto'] || 'http';
-  const host = req.headers['x-forwarded-host'] || req.headers.host;
-  const endpoint = `${protocol}://${host}/message`;
-
-  res.write('event: endpoint\n');
-  res.write(`data: ${endpoint}\n\n`);
-  console.log('Sent endpoint:', endpoint);
-
-  // Keep connection alive with periodic heartbeat
-  const heartbeat = setInterval(() => {
-    if (res.writable) {
-      res.write(': ping\n\n');
-      console.log(`[${sessionId}] Heartbeat sent (active connections: ${activeConnections.size})`);
+      const server = createMcpServer();
+      await server.connect(transport);
     } else {
-      console.log(`[${sessionId}] Connection no longer writable, stopping heartbeat`);
-      clearInterval(heartbeat);
-      activeConnections.delete(sessionId);
-    }
-  }, 15000);
-
-  // Clean up on connection close
-  req.on('close', () => {
-    console.log(`[${sessionId}] Request closed (active connections: ${activeConnections.size})`);
-    clearInterval(heartbeat);
-    activeConnections.delete(sessionId);
-  });
-
-  res.on('close', () => {
-    console.log(`[${sessionId}] Response closed (active connections: ${activeConnections.size})`);
-    clearInterval(heartbeat);
-    activeConnections.delete(sessionId);
-  });
-
-  res.on('error', (err) => {
-    console.error(`[${sessionId}] SSE error:`, err.message);
-    clearInterval(heartbeat);
-    activeConnections.delete(sessionId);
-  });
-
-  res.on('finish', () => {
-    console.log(`[${sessionId}] Response finished`);
-  });
-
-  console.log(`[${sessionId}] SSE connection established (total active: ${activeConnections.size})`);
-});
-
-// Message endpoint for SSE (receives client messages)
-app.post('/message', authenticate, async (req: Request, res: Response) => {
-  const jsonrpcRequest = req.body;
-
-  console.log('\n=== MESSAGE RECEIVED ===');
-  console.log('Method:', jsonrpcRequest?.method);
-  console.log('ID:', jsonrpcRequest?.id);
-  console.log('Active connections:', activeConnections.size);
-
-  // Validate request
-  if (!jsonrpcRequest || !jsonrpcRequest.method) {
-    console.error('Invalid JSON-RPC request: missing method');
-    res.status(400).json({
-      jsonrpc: '2.0',
-      error: { code: -32600, message: 'Invalid Request' },
-      id: null
-    });
-    return;
-  }
-
-  // Find the most recent SSE connection (there should typically only be one)
-  const connection = Array.from(activeConnections.values())[0];
-
-  if (!connection) {
-    console.error('ERROR: No active SSE connection found!');
-    console.error('Available connections:', Array.from(activeConnections.keys()));
-    res.status(503).json({
-      jsonrpc: '2.0',
-      error: { code: -32000, message: 'No active connection' },
-      id: jsonrpcRequest?.id || null
-    });
-    return;
-  }
-
-  console.log('Using SSE session:', connection.sessionId);
-  console.log('Connection writable:', connection.res.writable);
-
-  try {
-    // Check if this is a notification (no id field) or a request
-    // In JSON-RPC 2.0, notifications are requests without an 'id' field
-    const isNotification = !('id' in jsonrpcRequest);
-
-    if (isNotification) {
-      // Notifications don't get responses, just acknowledge
-      console.log('Received notification:', jsonrpcRequest.method);
-      res.status(202).end();
-      return;
-    }
-
-    // Process JSON-RPC request
-    let response;
-
-    // Route the request to the appropriate MCP handler
-    if (jsonrpcRequest.method === 'initialize') {
-      response = {
+      res.status(404).json({
         jsonrpc: '2.0',
-        id: jsonrpcRequest.id,
-        result: {
-          protocolVersion: '2024-11-05',
-          capabilities: {
-            tools: {},
-            resources: {},
-            prompts: {},
-          },
-          serverInfo: {
-            name: 'amazon-cart-server',
-            version: '1.0.0',
-          },
-        },
-      };
-    } else if (jsonrpcRequest.method === 'tools/list') {
-      console.log('List tools request received');
-      response = {
-        jsonrpc: '2.0',
-        id: jsonrpcRequest.id,
-        result: {
-          tools: [
-            {
-              name: 'search_amazon',
-              description: 'Search for products on Amazon',
-              inputSchema: {
-                type: 'object',
-                properties: {
-                  query: {
-                    type: 'string',
-                    description: 'Search query for Amazon products',
-                  },
-                },
-                required: ['query'],
-              },
-            },
-            {
-              name: 'add_to_cart',
-              description: 'Add a product to Amazon cart',
-              inputSchema: {
-                type: 'object',
-                properties: {
-                  query: {
-                    type: 'string',
-                    description: 'Product name to search and add',
-                  },
-                  asin: {
-                    type: 'string',
-                    description: 'Amazon ASIN (product ID) - use this if known',
-                  },
-                  quantity: {
-                    type: 'number',
-                    description: 'Quantity to add (default: 1)',
-                    default: 1,
-                  },
-                },
-              },
-            },
-            {
-              name: 'view_cart',
-              description: 'View current Amazon cart contents',
-              inputSchema: {
-                type: 'object',
-                properties: {},
-              },
-            },
-            {
-              name: 'check_login',
-              description: 'Check if logged into Amazon',
-              inputSchema: {
-                type: 'object',
-                properties: {},
-              },
-            },
-            {
-              name: 'save_session',
-              description: '(Optional) Manually trigger session save. Sessions are automatically saved periodically, after operations, and on shutdown, so this is typically not needed.',
-              inputSchema: {
-                type: 'object',
-                properties: {},
-              },
-            },
-          ],
-        },
-      };
-    } else if (jsonrpcRequest.method === 'tools/call') {
-      console.log('Tool call request:', jsonrpcRequest.params);
-      const toolName = jsonrpcRequest.params.name;
-      const toolArgs = jsonrpcRequest.params.arguments || {};
-
-      let toolResult;
-      try {
-        switch (toolName) {
-          case 'search_amazon':
-            toolResult = await searchProducts(toolArgs.query);
-            break;
-          case 'add_to_cart':
-            toolResult = await addToCart(toolArgs);
-            break;
-          case 'view_cart':
-            toolResult = await getCart();
-            break;
-          case 'check_login':
-            toolResult = await checkLoginStatus();
-            break;
-          case 'save_session':
-            const sessionPage = await getPage();
-            await saveAmazonSession(sessionPage);
-            toolResult = {
-              success: true,
-              message: 'Amazon session saved successfully. Your login will persist across server restarts.',
-            };
-            break;
-          default:
-            throw new Error(`Unknown tool: ${toolName}`);
-        }
-
-        response = {
-          jsonrpc: '2.0',
-          id: jsonrpcRequest.id,
-          result: {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify(toolResult, null, 2),
-              },
-            ],
-          },
-        };
-      } catch (error) {
-        response = {
-          jsonrpc: '2.0',
-          id: jsonrpcRequest.id,
-          error: {
-            code: -32603,
-            message: error instanceof Error ? error.message : 'Tool execution failed',
-          },
-        };
-      }
-    } else {
-      // Unknown method
-      response = {
-        jsonrpc: '2.0',
-        id: jsonrpcRequest.id,
-        error: {
-          code: -32601,
-          message: `Method not found: ${jsonrpcRequest.method}`,
-        },
-      };
-    }
-
-    // Check if connection is still writable before sending
-    if (!connection.res.writable) {
-      console.error('ERROR: SSE connection is not writable!');
-      res.status(503).json({
-        jsonrpc: '2.0',
-        error: { code: -32000, message: 'SSE connection closed' },
-        id: jsonrpcRequest?.id || null
+        error: { code: -32000, message: 'Session not found. The client must start a new session.' },
+        id: null,
       });
       return;
     }
 
-    // Send response via SSE
-    sendSSEMessage(connection.res, response);
+    await transport.handleRequest(req, res, req.body);
 
-    // Acknowledge receipt of POST
-    res.status(202).end();
-  } catch (error) {
-    console.error('Error handling message:', error);
-    if (!res.headersSent) {
-      res.status(500).json({
+    // Store transport after handleRequest so sessionId is available
+    if (transport.sessionId && !transports.has(transport.sessionId)) {
+      transports.set(transport.sessionId, transport);
+    }
+  } else if (req.method === 'GET') {
+    if (sessionId && transports.has(sessionId)) {
+      const transport = transports.get(sessionId)!;
+      await transport.handleRequest(req, res);
+    } else {
+      res.status(400).json({
         jsonrpc: '2.0',
-        error: { code: -32603, message: 'Internal error' },
-        id: jsonrpcRequest?.id || null
+        error: { code: -32000, message: 'Missing or invalid session ID for GET SSE stream.' },
+        id: null,
       });
     }
+  } else if (req.method === 'DELETE') {
+    if (sessionId && transports.has(sessionId)) {
+      const transport = transports.get(sessionId)!;
+      await transport.close();
+      transports.delete(sessionId);
+      res.status(200).end();
+    } else {
+      res.status(404).json({
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Session not found.' },
+        id: null,
+      });
+    }
+  } else {
+    res.status(405).end();
   }
 });
 
 // Start server
 app.listen(PORT, async () => {
   console.log(`Amazon MCP Server running on port ${PORT}`);
-  console.log(`Use ngrok to expose: ngrok http ${PORT}`);
+  console.log(`MCP endpoint: http://localhost:${PORT}/mcp`);
   console.log(`Health check: http://localhost:${PORT}/health`);
 
-  // Initialize browser and open Amazon for login
   console.log('\nInitializing browser...');
   try {
     await getBrowser();
     const page = await getPage();
     const AMAZON_DOMAIN = process.env.AMAZON_DOMAIN || 'amazon.com';
 
-    // Try to restore previous session first
     const restored = await restoreAmazonSession(page);
-
     await page.goto(`https://www.${AMAZON_DOMAIN}`, { waitUntil: 'networkidle2' });
 
     if (restored) {
@@ -608,7 +277,6 @@ app.listen(PORT, async () => {
     }
     console.log('✓ Your session will be automatically saved.\n');
 
-    // Set up periodic session saving (every 5 minutes)
     setInterval(async () => {
       try {
         const currentPage = await getPage();
@@ -617,8 +285,7 @@ app.listen(PORT, async () => {
       } catch (error) {
         console.error('Failed to auto-save session:', error);
       }
-    }, 5 * 60 * 1000); // 5 minutes
-
+    }, 5 * 60 * 1000);
   } catch (error) {
     console.error('✗ Failed to initialize browser:', error);
   }
@@ -628,7 +295,6 @@ app.listen(PORT, async () => {
 process.on('SIGINT', async () => {
   console.log('\nShutting down...');
 
-  // Save session before closing browser
   try {
     const page = await getPage();
     await saveAmazonSession(page);
@@ -636,6 +302,11 @@ process.on('SIGINT', async () => {
   } catch (error) {
     console.error('Failed to save session before shutdown:', error);
   }
+
+  for (const transport of transports.values()) {
+    await transport.close();
+  }
+  transports.clear();
 
   await closeBrowser();
   process.exit(0);

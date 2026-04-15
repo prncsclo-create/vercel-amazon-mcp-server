@@ -1,98 +1,98 @@
-import { Page } from 'puppeteer';
-import fs from 'fs';
-import path from 'path';
+import crypto from 'crypto';
+import type { Page } from 'puppeteer-core';
 
-const COOKIES_FILE = path.resolve('./user-data/amazon-session-cookies.json');
+const AMAZON_DOMAIN = process.env.AMAZON_DOMAIN || 'amazon.com';
+const AMAZON_BASE_URL = `https://www.${AMAZON_DOMAIN}`;
+const SESSION_SECRET = process.env.SESSION_SECRET || process.env.AUTH_TOKEN || 'amazon-mcp-server-session';
 
-interface SerializedCookie {
-  name: string;
-  value: string;
-  domain: string;
-  path: string;
-  expires: number;
-  httpOnly: boolean;
-  secure: boolean;
-  sameSite: 'Strict' | 'Lax' | 'None';
+type Cookie = Awaited<ReturnType<Page['cookies']>>[number];
+
+interface SessionPayload {
+  version: 1;
+  savedAt: string;
+  cookies: Cookie[];
 }
 
-/**
- * Save current Amazon cookies to a JSON file with extended expiration
- * This works around session-only cookies that expire when browser closes
- */
-export async function saveAmazonSession(page: Page): Promise<void> {
-  try {
-    const cookies = await page.cookies();
-    const amazonCookies = cookies.filter(c => c.domain.includes('amazon'));
+function base64UrlEncode(value: Buffer | string): string {
+  return Buffer.from(value).toString('base64url');
+}
 
-    // Convert session cookies to persistent ones by setting expiration
-    const oneYearFromNow = Date.now() / 1000 + (365 * 24 * 60 * 60);
-    const persistentCookies = amazonCookies.map(cookie => ({
+function base64UrlDecode(value: string): Buffer {
+  return Buffer.from(value, 'base64url');
+}
+
+function signPayload(payload: string): string {
+  return crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
+}
+
+function isCookieArray(value: unknown): value is Cookie[] {
+  return Array.isArray(value) && value.every((cookie) => cookie && typeof cookie === 'object' && 'domain' in cookie && 'name' in cookie && 'value' in cookie);
+}
+
+export function createSessionToken(cookies: Cookie[]): string | undefined {
+  const amazonCookies = cookies.filter((cookie) => cookie.domain?.includes('amazon'));
+
+  if (amazonCookies.length === 0) {
+    return undefined;
+  }
+
+  const payload: SessionPayload = {
+    version: 1,
+    savedAt: new Date().toISOString(),
+    cookies: amazonCookies.map((cookie) => ({
       ...cookie,
-      // If cookie has no expiration (session cookie), set it to 1 year from now
-      expires: cookie.expires && cookie.expires > 0 ? cookie.expires : oneYearFromNow,
-    }));
+      expires: cookie.expires && cookie.expires > 0 ? cookie.expires : Math.floor(Date.now() / 1000) + 365 * 24 * 60 * 60,
+    })),
+  };
 
-    fs.writeFileSync(COOKIES_FILE, JSON.stringify(persistentCookies, null, 2));
-    console.log(`✓ Saved ${persistentCookies.length} Amazon cookies to ${COOKIES_FILE}`);
-
-    const sessionCookies = amazonCookies.filter(c => !c.expires || c.expires === -1);
-    if (sessionCookies.length > 0) {
-      console.log(`  Converted ${sessionCookies.length} session cookies to persistent cookies`);
-    }
-  } catch (error) {
-    console.error('Failed to save Amazon session:', error);
-  }
+  const encodedPayload = base64UrlEncode(JSON.stringify(payload));
+  const signature = signPayload(encodedPayload);
+  return `v1.${encodedPayload}.${signature}`;
 }
 
-/**
- * Restore Amazon cookies from the saved JSON file
- * Call this after browser launch to restore the session
- */
-export async function restoreAmazonSession(page: Page): Promise<boolean> {
-  try {
-    if (!fs.existsSync(COOKIES_FILE)) {
-      console.log('ℹ No saved Amazon session found');
-      return false;
-    }
-
-    const cookiesData = fs.readFileSync(COOKIES_FILE, 'utf-8');
-    const cookies: SerializedCookie[] = JSON.parse(cookiesData);
-
-    // Filter out expired cookies
-    const now = Date.now() / 1000;
-    const validCookies = cookies.filter(c => c.expires > now);
-
-    if (validCookies.length === 0) {
-      console.log('⚠️  All saved Amazon cookies have expired');
-      return false;
-    }
-
-    await page.setCookie(...validCookies);
-    console.log(`✓ Restored ${validCookies.length} Amazon cookies from saved session`);
-
-    if (validCookies.length < cookies.length) {
-      console.log(`  (${cookies.length - validCookies.length} expired cookies were skipped)`);
-    }
-
-    return true;
-  } catch (error) {
-    console.error('Failed to restore Amazon session:', error);
-    return false;
+export function parseSessionToken(token?: string): Cookie[] | null {
+  if (!token) {
+    return null;
   }
-}
 
-/**
- * Check if the user is currently logged in to Amazon
- */
-export async function isLoggedIn(page: Page): Promise<boolean> {
+  const [version, encodedPayload, signature] = token.split('.');
+  if (version !== 'v1' || !encodedPayload || !signature) {
+    return null;
+  }
+
+  const expectedSignature = signPayload(encodedPayload);
+  const expectedBuffer = Buffer.from(expectedSignature);
+  const actualBuffer = Buffer.from(signature);
+
+  if (expectedBuffer.length !== actualBuffer.length || !crypto.timingSafeEqual(expectedBuffer, actualBuffer)) {
+    return null;
+  }
+
   try {
-    const accountText = await page.evaluate(() => {
-      const accountList = document.querySelector('#nav-link-accountList-nav-line-1');
-      return accountList?.textContent?.trim() || '';
-    });
+    const payload = JSON.parse(base64UrlDecode(encodedPayload).toString('utf8')) as Partial<SessionPayload>;
+    if (payload.version !== 1 || !isCookieArray(payload.cookies)) {
+      return null;
+    }
 
-    return accountText.includes('Hello');
+    const now = Math.floor(Date.now() / 1000);
+    return payload.cookies.filter((cookie) => !cookie.expires || cookie.expires > now);
   } catch {
+    return null;
+  }
+}
+
+export async function restoreAmazonSession(page: Page, token?: string): Promise<boolean> {
+  const cookies = parseSessionToken(token);
+  if (!cookies || cookies.length === 0) {
     return false;
   }
+
+  await page.goto(AMAZON_BASE_URL, { waitUntil: 'domcontentloaded' });
+  await page.setCookie(...cookies);
+  return true;
+}
+
+export async function captureAmazonSession(page: Page): Promise<string | undefined> {
+  const cookies = await page.cookies();
+  return createSessionToken(cookies);
 }

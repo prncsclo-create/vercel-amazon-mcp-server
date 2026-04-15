@@ -1,7 +1,8 @@
 export interface AddToCartParams {
-  query?: string;           // Search query
-  asin?: string;            // Amazon ASIN
-  quantity?: number;        // Quantity to add (default: 1)
+  query?: string;
+  asin?: string;
+  quantity?: number;
+  sessionToken?: string;
 }
 
 export interface CartItem {
@@ -23,6 +24,7 @@ export interface SearchResult {
 export interface OperationResult {
   success: boolean;
   message: string;
-  data?: any;
+  data?: unknown;
   error?: string;
+  sessionToken?: string;
 }

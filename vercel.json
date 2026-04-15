@@ -1,7 +1,9 @@
 {
   "version": 2,
   "functions": {
-    "api/mcp.ts": {}
+    "api/mcp.ts": {
+      "maxDuration": 60
+    }
   },
   "rewrites": [
     {

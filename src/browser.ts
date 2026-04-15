@@ -21,6 +21,8 @@ export async function getBrowser(): Promise<Browser> {
     process.env.USER_DATA_DIR || (process.env.VERCEL ? '/tmp/user-data' : './user-data'),
   );
 
+  const defaultViewport = { width: 1280, height: 800 } as const;
+
   console.log('Launching browser with config:', {
     headless: true,
     userDataDir,
@@ -37,10 +39,7 @@ export async function getBrowser(): Promise<Browser> {
         '--disable-features=IsolateOrigins,site-per-process',
       ],
       ignoreDefaultArgs: ['--enable-automation'],
-      defaultViewport: chromium.defaultViewport ?? {
-        width: 1280,
-        height: 800,
-      },
+      defaultViewport,
     });
 
     // Set additional properties to avoid detection and check for existing cookies

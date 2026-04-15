@@ -1,4 +1,4 @@
-import { Page } from 'puppeteer';
+import { Page } from 'puppeteer-core';
 import { getPage } from './browser';
 import { AddToCartParams, CartItem, SearchResult, OperationResult } from './types';
 import { saveAmazonSession } from './session-manager';

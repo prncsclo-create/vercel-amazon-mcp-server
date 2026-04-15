@@ -89,7 +89,7 @@ const TOOLS = [
 ];
 
 // Create a new MCP server instance with handlers
-function createMcpServer(): Server {
+export function createMcpServer(): Server {
   const server = new Server(
     { name: 'amazon-cart-server', version: '1.0.0' },
     { capabilities: { tools: {} } },
@@ -158,7 +158,7 @@ function createMcpServer(): Server {
 }
 
 // Create Express server
-const app = express();
+export const app = express();
 app.use(cors({ origin: '*', credentials: true }));
 app.disable('etag');
 app.disable('x-powered-by');
@@ -255,59 +255,63 @@ app.all('/mcp', authenticate, express.json(), async (req: Request, res: Response
   }
 });
 
-// Start server
-app.listen(PORT, async () => {
-  console.log(`Amazon MCP Server running on port ${PORT}`);
-  console.log(`MCP endpoint: http://localhost:${PORT}/mcp`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
+export async function startLocalServer(): Promise<void> {
+  app.listen(PORT, async () => {
+    console.log(`Amazon MCP Server running on port ${PORT}`);
+    console.log(`MCP endpoint: http://localhost:${PORT}/mcp`);
+    console.log(`Health check: http://localhost:${PORT}/health`);
 
-  console.log('\nInitializing browser...');
-  try {
-    await getBrowser();
-    const page = await getPage();
-    const AMAZON_DOMAIN = process.env.AMAZON_DOMAIN || 'amazon.com';
+    console.log('\nInitializing browser...');
+    try {
+      await getBrowser();
+      const page = await getPage();
+      const AMAZON_DOMAIN = process.env.AMAZON_DOMAIN || 'amazon.com';
 
-    const restored = await restoreAmazonSession(page);
-    await page.goto(`https://www.${AMAZON_DOMAIN}`, { waitUntil: 'networkidle2' });
+      const restored = await restoreAmazonSession(page);
+      await page.goto(`https://www.${AMAZON_DOMAIN}`, { waitUntil: 'networkidle2' });
 
-    if (restored) {
-      console.log('✓ Browser opened with restored session!');
-    } else {
-      console.log('✓ Browser opened! Please log into Amazon if needed.');
-    }
-    console.log('✓ Your session will be automatically saved.\n');
-
-    setInterval(async () => {
-      try {
-        const currentPage = await getPage();
-        await saveAmazonSession(currentPage);
-        console.log('✓ Session auto-saved');
-      } catch (error) {
-        console.error('Failed to auto-save session:', error);
+      if (restored) {
+        console.log('✓ Browser opened with restored session!');
+      } else {
+        console.log('✓ Browser opened! Please log into Amazon if needed.');
       }
-    }, 5 * 60 * 1000);
-  } catch (error) {
-    console.error('✗ Failed to initialize browser:', error);
-  }
-});
+      console.log('✓ Your session will be automatically saved.\n');
 
-// Cleanup on exit
-process.on('SIGINT', async () => {
-  console.log('\nShutting down...');
+      setInterval(async () => {
+        try {
+          const currentPage = await getPage();
+          await saveAmazonSession(currentPage);
+          console.log('✓ Session auto-saved');
+        } catch (error) {
+          console.error('Failed to auto-save session:', error);
+        }
+      }, 5 * 60 * 1000);
+    } catch (error) {
+      console.error('✗ Failed to initialize browser:', error);
+    }
+  });
 
-  try {
-    const page = await getPage();
-    await saveAmazonSession(page);
-    console.log('✓ Session saved before shutdown');
-  } catch (error) {
-    console.error('Failed to save session before shutdown:', error);
-  }
+  process.on('SIGINT', async () => {
+    console.log('\nShutting down...');
 
-  for (const transport of transports.values()) {
-    await transport.close();
-  }
-  transports.clear();
+    try {
+      const page = await getPage();
+      await saveAmazonSession(page);
+      console.log('✓ Session saved before shutdown');
+    } catch (error) {
+      console.error('Failed to save session before shutdown:', error);
+    }
 
-  await closeBrowser();
-  process.exit(0);
-});
+    for (const transport of transports.values()) {
+      await transport.close();
+    }
+    transports.clear();
+
+    await closeBrowser();
+    process.exit(0);
+  });
+}
+
+if (process.env.VERCEL !== '1' && typeof require !== 'undefined' && require.main === module) {
+  void startLocalServer();
+}

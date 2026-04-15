@@ -21,12 +21,12 @@ interface SerializedCookie {
  */
 export async function saveAmazonSession(page: Page): Promise<void> {
   try {
-    const cookies = await page.cookies();
-    const amazonCookies = cookies.filter((c: SerializedCookie) => c.domain.includes('amazon'));
+    const cookies = (await page.cookies()) as any[];
+    const amazonCookies = cookies.filter((c: any) => c.domain.includes('amazon'));
 
     // Convert session cookies to persistent ones by setting expiration
     const oneYearFromNow = Date.now() / 1000 + (365 * 24 * 60 * 60);
-    const persistentCookies = amazonCookies.map((cookie: SerializedCookie) => ({
+    const persistentCookies = amazonCookies.map((cookie: any) => ({
       ...cookie,
       // If cookie has no expiration (session cookie), set it to 1 year from now
       expires: cookie.expires && cookie.expires > 0 ? cookie.expires : oneYearFromNow,
@@ -35,7 +35,7 @@ export async function saveAmazonSession(page: Page): Promise<void> {
     fs.writeFileSync(COOKIES_FILE, JSON.stringify(persistentCookies, null, 2));
     console.log(`✓ Saved ${persistentCookies.length} Amazon cookies to ${COOKIES_FILE}`);
 
-    const sessionCookies = amazonCookies.filter((c: SerializedCookie) => !c.expires || c.expires === -1);
+    const sessionCookies = amazonCookies.filter((c: any) => !c.expires || c.expires === -1);
     if (sessionCookies.length > 0) {
       console.log(`  Converted ${sessionCookies.length} session cookies to persistent cookies`);
     }
@@ -56,18 +56,18 @@ export async function restoreAmazonSession(page: Page): Promise<boolean> {
     }
 
     const cookiesData = fs.readFileSync(COOKIES_FILE, 'utf-8');
-    const cookies: SerializedCookie[] = JSON.parse(cookiesData);
+    const cookies: any[] = JSON.parse(cookiesData);
 
     // Filter out expired cookies
     const now = Date.now() / 1000;
-    const validCookies = cookies.filter((c: SerializedCookie) => c.expires > now);
+    const validCookies = cookies.filter((c: any) => c.expires > now);
 
     if (validCookies.length === 0) {
       console.log('⚠️  All saved Amazon cookies have expired');
       return false;
     }
 
-    await page.setCookie(...validCookies);
+    await page.setCookie(...(validCookies as any));
     console.log(`✓ Restored ${validCookies.length} Amazon cookies from saved session`);
 
     if (validCookies.length < cookies.length) {

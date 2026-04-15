@@ -2,7 +2,7 @@
   "version": 2,
   "functions": {
     "api/mcp.ts": {
-      "runtime": "@vercel/node"
+      "runtime": "nodejs20.x"
     }
   },
   "rewrites": [

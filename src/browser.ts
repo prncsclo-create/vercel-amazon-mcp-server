@@ -1,4 +1,5 @@
-import puppeteer, { Browser, Page } from 'puppeteer';
+import puppeteer, { Browser, Page } from 'puppeteer-core';
+import chromium from '@sparticuz/chromium';
 import path from 'path';
 
 let browserInstance: Browser | null = null;
@@ -13,79 +14,79 @@ export async function getBrowser(): Promise<Browser> {
     console.log('Browser disconnected, cleaning up before relaunch...');
     browserInstance = null;
     // Give Chrome a moment to release the lock file
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    await new Promise((resolve) => setTimeout(resolve, 1000));
   }
 
-  const userDataDir = path.resolve(process.env.USER_DATA_DIR || './user-data');
-  const headless = process.env.HEADLESS === 'true';
+  const userDataDir = path.resolve(
+    process.env.USER_DATA_DIR || (process.env.VERCEL ? '/tmp/user-data' : './user-data'),
+  );
 
   console.log('Launching browser with config:', {
-    headless,
+    headless: true,
     userDataDir,
   });
 
   try {
     browserInstance = await puppeteer.launch({
-    headless,
-    userDataDir,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-blink-features=AutomationControlled',
-      '--disable-features=IsolateOrigins,site-per-process',
-      '--flag-switches-begin --disable-site-isolation-trials --flag-switches-end',
-    ],
-    ignoreDefaultArgs: ['--enable-automation'],
-    defaultViewport: {
-      width: 1280,
-      height: 800,
-    },
-  });
+      headless: true,
+      executablePath: await chromium.executablePath(),
+      userDataDir,
+      args: [
+        ...chromium.args,
+        '--disable-blink-features=AutomationControlled',
+        '--disable-features=IsolateOrigins,site-per-process',
+      ],
+      ignoreDefaultArgs: ['--enable-automation'],
+      defaultViewport: chromium.defaultViewport ?? {
+        width: 1280,
+        height: 800,
+      },
+    });
 
-  // Set additional properties to avoid detection and check for existing cookies
-  {
-    const pages = await browserInstance.pages();
-    if (pages.length > 0) {
-      const page = pages[0];
-      await page.evaluateOnNewDocument(() => {
-        // Remove webdriver property
-        Object.defineProperty(navigator, 'webdriver', {
-          get: () => undefined,
+    // Set additional properties to avoid detection and check for existing cookies
+    {
+      const pages = await browserInstance.pages();
+      if (pages.length > 0) {
+        const page = pages[0];
+        await page.evaluateOnNewDocument(() => {
+          // Remove webdriver property
+          Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined,
+          });
+
+          // Mock plugins and languages
+          Object.defineProperty(navigator, 'plugins', {
+            get: () => [1, 2, 3, 4, 5],
+          });
+
+          Object.defineProperty(navigator, 'languages', {
+            get: () => ['en-US', 'en'],
+          });
         });
 
-        // Mock plugins and languages
-        Object.defineProperty(navigator, 'plugins', {
-          get: () => [1, 2, 3, 4, 5],
+        // Check if we have existing Amazon cookies
+        const client = await page.target().createCDPSession();
+        const { cookies } = await client.send('Network.getCookies', {
+          urls: ['https://www.amazon.com'],
         });
+        await client.detach();
 
-        Object.defineProperty(navigator, 'languages', {
-          get: () => ['en-US', 'en'],
-        });
-      });
+        console.log('✓ Browser launched successfully');
+        console.log('✓ User data dir:', userDataDir);
+        console.log(`✓ Loaded ${cookies.length} existing Amazon cookies from profile`);
 
-      // Check if we have existing Amazon cookies
-      const client = await page.target().createCDPSession();
-      const { cookies } = await client.send('Network.getCookies', {
-        urls: ['https://www.amazon.com'],
-      });
-      await client.detach();
-
-      console.log('✓ Browser launched successfully');
-      console.log('✓ User data dir:', userDataDir);
-      console.log(`✓ Loaded ${cookies.length} existing Amazon cookies from profile`);
-
-      // Check for session cookies
-      const hasSessionCookies = cookies.some((c: any) => c.name === 'session-id' || c.name === 'session-token');
-      if (hasSessionCookies) {
-        console.log('✓ Found Amazon session cookies - you may already be logged in');
+        // Check for session cookies
+        const hasSessionCookies = cookies.some((c: any) => c.name === 'session-id' || c.name === 'session-token');
+        if (hasSessionCookies) {
+          console.log('✓ Found Amazon session cookies - you may already be logged in');
+        } else {
+          console.log('ℹ No Amazon session cookies found - you will need to log in');
+        }
       } else {
-        console.log('ℹ No Amazon session cookies found - you will need to log in');
+        console.log('✓ Browser launched successfully');
+        console.log('✓ User data dir:', userDataDir);
       }
-    } else {
-      console.log('✓ Browser launched successfully');
-      console.log('✓ User data dir:', userDataDir);
     }
-  }
 
     return browserInstance;
   } catch (error) {
